@@ -11,7 +11,9 @@
     "example:callbacks": "tsx src/examples/callbacks.ts",
     "screenshot": "tsx src/examples/screenshot-test.ts",
     "screenshot:login": "tsx src/examples/screenshot-test.ts --login",
-    "viewport-test": "tsx src/examples/viewport-test.ts"
+    "viewport-test": "tsx src/examples/viewport-test.ts",
+    "fix-responsive": "tsx src/examples/fix-responsive.ts",
+    "full-workflow": "tsx src/examples/full-workflow.ts"
   },
   "keywords": [
     "cursor",

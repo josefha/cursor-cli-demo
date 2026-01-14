@@ -5,16 +5,21 @@
  * evaluates the UI, and generates a Markdown + PDF report.
  * 
  * Usage:
- *   npx tsx src/examples/viewport-test.ts <url> ["<task>"]
+ *   npx tsx src/examples/viewport-test.ts <url> [options]
+ * 
+ * Options:
+ *   --accessibility    Include accessibility audit
+ *   --compare <dir>    Compare with previous report (before/after)
  * 
  * Examples:
  *   npx tsx src/examples/viewport-test.ts http://localhost:5173
- *   npx tsx src/examples/viewport-test.ts https://example.com "Check responsive design"
+ *   npx tsx src/examples/viewport-test.ts http://localhost:5173 --accessibility
+ *   npx tsx src/examples/viewport-test.ts http://localhost:5173 --compare output/report-2026-01-14T18-49-04
  */
 
 import "dotenv/config";
 import puppeteer, { Viewport } from "puppeteer";
-import { mkdirSync, writeFileSync } from "fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { mdToPdf } from "md-to-pdf";
@@ -86,19 +91,34 @@ const DEVICES: DeviceConfig[] = [
   },
 ];
 
+interface AccessibilityIssue {
+  type: string;
+  description: string;
+  element?: string;
+  suggestion?: string;
+}
+
 interface ScreenshotResult {
   device: string;
   path: string;
   filename: string;
   viewport: Viewport;
+  accessibilitySnapshot?: object;
+  accessibilityIssues?: AccessibilityIssue[];
 }
 
 async function takeMultiViewportScreenshots(
   url: string,
   reportDir: string,
-  waitTime: number = 2000
+  options: { waitTime?: number; includeAccessibility?: boolean } = {}
 ): Promise<ScreenshotResult[]> {
-  console.log(`🌐 Testing URL: ${url}\n`);
+  const { waitTime = 2000, includeAccessibility = false } = options;
+
+  console.log(`🌐 Testing URL: ${url}`);
+  if (includeAccessibility) {
+    console.log(`♿ Accessibility audit: enabled`);
+  }
+  console.log("");
 
   mkdirSync(USER_DATA_DIR, { recursive: true });
 
@@ -139,19 +159,164 @@ async function takeMultiViewportScreenshots(
     await page.screenshot({ path: screenshotPath, fullPage: false });
     console.log(`   ✅ Screenshot saved`);
 
-    results.push({
+    const result: ScreenshotResult = {
       device: device.name,
       path: screenshotPath,
       filename,
       viewport: device.viewport,
-    });
+    };
 
+    // Accessibility audit
+    if (includeAccessibility) {
+      console.log(`   ♿ Running accessibility audit...`);
+      try {
+        const accessibilitySnapshot = await page.accessibility.snapshot();
+        result.accessibilitySnapshot = accessibilitySnapshot || undefined;
+
+        // Analyze accessibility issues
+        const issues = await analyzeAccessibility(page, device);
+        result.accessibilityIssues = issues;
+
+        if (issues.length > 0) {
+          console.log(`   ⚠️  ${issues.length} accessibility issues found`);
+        } else {
+          console.log(`   ✅ No major accessibility issues`);
+        }
+      } catch (error) {
+        console.log(`   ⚠️  Accessibility audit failed: ${error}`);
+      }
+    }
+
+    results.push(result);
     await page.close();
   }
 
   await browser.close();
-
   return results;
+}
+
+interface A11yCheckResults {
+  missingAltText: string[];
+  smallTouchTargets: string[];
+  missingLabels: string[];
+  missingLandmarks: boolean;
+  missingHeadings: boolean;
+}
+
+async function analyzeAccessibility(
+  page: puppeteer.Page,
+  device: DeviceConfig
+): Promise<AccessibilityIssue[]> {
+  const issues: AccessibilityIssue[] = [];
+
+  // Check for common accessibility issues
+  const checks = await page.evaluate((isMobile) => {
+    const results = {
+      missingAltText: [] as string[],
+      smallTouchTargets: [] as string[],
+      missingLabels: [] as string[],
+      missingLandmarks: false,
+      missingHeadings: false,
+    };
+
+    // Check images without alt text
+    document.querySelectorAll("img").forEach((img: HTMLImageElement) => {
+      if (!img.alt && !img.getAttribute("aria-label")) {
+        results.missingAltText.push(img.src.slice(-50));
+      }
+    });
+
+    // Check for small touch targets on mobile
+    if (isMobile) {
+      document
+        .querySelectorAll("button, a, input, select, [role='button']")
+        .forEach((el: Element) => {
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 44 || rect.height < 44) {
+            const text =
+              el.textContent?.slice(0, 30) ||
+              el.getAttribute("aria-label") ||
+              "unknown";
+            results.smallTouchTargets.push(text);
+          }
+        });
+    }
+
+    // Check form inputs without labels
+    document.querySelectorAll("input, select, textarea").forEach((input: Element) => {
+      const id = input.id;
+      const hasLabel = id && document.querySelector(`label[for="${id}"]`);
+      const hasAriaLabel = input.getAttribute("aria-label");
+      const hasAriaLabelledBy = input.getAttribute("aria-labelledby");
+
+      if (!hasLabel && !hasAriaLabel && !hasAriaLabelledBy) {
+        results.missingLabels.push(
+          input.getAttribute("name") || input.getAttribute("type") || "unknown"
+        );
+      }
+    });
+
+    // Check for landmarks
+    const hasMain = !!document.querySelector("main, [role='main']");
+    const hasNav = !!document.querySelector("nav, [role='navigation']");
+    results.missingLandmarks = !hasMain || !hasNav;
+
+    // Check for headings
+    const headings = document.querySelectorAll("h1, h2, h3, h4, h5, h6");
+    results.missingHeadings = headings.length === 0;
+
+    return results;
+  }, device.viewport.isMobile || false) as A11yCheckResults;
+
+  // Convert to issues
+  if (checks.missingAltText.length > 0) {
+    issues.push({
+      type: "missing-alt-text",
+      description: `${checks.missingAltText.length} images missing alt text`,
+      element: checks.missingAltText.slice(0, 3).join(", "),
+      suggestion: 'Add descriptive alt="" attributes to all images',
+    });
+  }
+
+  if (checks.smallTouchTargets.length > 0) {
+    issues.push({
+      type: "small-touch-target",
+      description: `${checks.smallTouchTargets.length} interactive elements below 44x44px minimum`,
+      element: checks.smallTouchTargets.slice(0, 3).join(", "),
+      suggestion:
+        "Increase min-width and min-height to 44px for touch targets",
+    });
+  }
+
+  if (checks.missingLabels.length > 0) {
+    issues.push({
+      type: "missing-label",
+      description: `${checks.missingLabels.length} form inputs missing accessible labels`,
+      element: checks.missingLabels.slice(0, 3).join(", "),
+      suggestion:
+        "Add <label> elements or aria-label attributes to form inputs",
+    });
+  }
+
+  if (checks.missingLandmarks) {
+    issues.push({
+      type: "missing-landmarks",
+      description: "Page missing main structural landmarks",
+      suggestion:
+        "Add <main>, <nav>, <header>, <footer> elements for screen reader navigation",
+    });
+  }
+
+  if (checks.missingHeadings) {
+    issues.push({
+      type: "missing-headings",
+      description: "Page has no heading elements",
+      suggestion:
+        "Add hierarchical headings (h1-h6) for document structure and screen reader navigation",
+    });
+  }
+
+  return issues;
 }
 
 interface DeviceEvaluation {
@@ -166,8 +331,10 @@ interface DeviceEvaluation {
 async function evaluateScreenshots(
   results: ScreenshotResult[],
   url: string,
-  customTask?: string
+  options: { customTask?: string; includeAccessibility?: boolean } = {}
 ): Promise<{ evaluations: DeviceEvaluation[]; rawResponse: string }> {
+  const { customTask, includeAccessibility } = options;
+
   const apiKey = process.env.CURSOR_API_KEY;
 
   if (!apiKey) {
@@ -184,17 +351,40 @@ async function evaluateScreenshots(
   console.log(`\n🤖 Sending screenshots to Cursor Agent for evaluation...`);
 
   const screenshotList = results
-    .map((r) => `- ${r.device} (${r.viewport.width}x${r.viewport.height}): ${r.path}`)
+    .map(
+      (r) => `- ${r.device} (${r.viewport.width}x${r.viewport.height}): ${r.path}`
+    )
     .join("\n");
 
-  const defaultTask = `Evaluate if the UI looks good or broken in each viewport.`;
+  // Add accessibility issues to context if enabled
+  let accessibilityContext = "";
+  if (includeAccessibility) {
+    accessibilityContext = `\n\n## Accessibility Audit Results\n`;
+    for (const result of results) {
+      if (result.accessibilityIssues && result.accessibilityIssues.length > 0) {
+        accessibilityContext += `\n### ${result.device}\n`;
+        for (const issue of result.accessibilityIssues) {
+          accessibilityContext += `- **${issue.type}**: ${issue.description}\n`;
+          if (issue.suggestion) {
+            accessibilityContext += `  - Suggestion: ${issue.suggestion}\n`;
+          }
+        }
+      }
+    }
+  }
 
+  const defaultTask = `Evaluate if the UI looks good or broken in each viewport.`;
   const task = customTask || defaultTask;
+
+  const accessibilityInstructions = includeAccessibility
+    ? `\n- Include accessibility issues in your evaluation\n- Rate accessibility separately (A11y: ✅ Good, ⚠️ Issues, ❌ Critical)`
+    : "";
 
   const prompt = `I've taken screenshots of ${url} across multiple device viewports for responsive design testing.
 
 ## Screenshots taken:
 ${screenshotList}
+${accessibilityContext}
 
 ## Task:
 ${task}
@@ -209,14 +399,14 @@ Please read/view each screenshot and provide evaluation in this EXACT JSON forma
       "status": "good" | "minor_issues" | "broken",
       "feedback": "Brief overall feedback",
       "issues": ["Issue 1", "Issue 2"],
-      "suggestions": ["Specific CSS/code fix suggestion 1", "Suggestion 2"]
+      "suggestions": ["Specific CSS/code fix suggestion 1", "Suggestion 2"]${includeAccessibility ? ',\n      "accessibility_status": "good" | "issues" | "critical",\n      "accessibility_issues": ["A11y issue 1"]' : ""}
     }
   ],
   "summary": "Overall summary of responsive design quality",
   "priority_fixes": ["Most important fix 1", "Fix 2", "Fix 3"]
 }
 
-Be specific in suggestions - include CSS properties, selectors, or component names when possible.
+Be specific in suggestions - include CSS properties, selectors, or component names when possible.${accessibilityInstructions}
 Output ONLY the JSON, no other text.`;
 
   const { stream } = agent.submit({ message: prompt });
@@ -236,7 +426,6 @@ Output ONLY the JSON, no other text.`;
   // Parse JSON from response
   let evaluations: DeviceEvaluation[] = [];
   try {
-    // Try to extract JSON from the response
     const jsonMatch = rawResponse.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
@@ -254,8 +443,11 @@ function generateMarkdownReport(
   results: ScreenshotResult[],
   evaluations: DeviceEvaluation[],
   rawResponse: string,
-  timestamp: string
+  timestamp: string,
+  options: { includeAccessibility?: boolean; compareDir?: string } = {}
 ): string {
+  const { includeAccessibility, compareDir } = options;
+
   const date = new Date().toLocaleDateString("en-US", {
     weekday: "long",
     year: "numeric",
@@ -268,14 +460,13 @@ function generateMarkdownReport(
 **URL:** ${url}  
 **Date:** ${date}  
 **Report ID:** ${timestamp}
-
+${includeAccessibility ? "**Accessibility Audit:** Included ♿\n" : ""}
 ---
 
 ## Summary
 
 `;
 
-  // Add summary section
   if (evaluations.length > 0) {
     const statusCounts = {
       good: evaluations.filter((e) => e.status === "good").length,
@@ -292,13 +483,30 @@ function generateMarkdownReport(
 `;
   }
 
+  // Accessibility summary
+  if (includeAccessibility) {
+    const totalA11yIssues = results.reduce(
+      (sum, r) => sum + (r.accessibilityIssues?.length || 0),
+      0
+    );
+    md += `### Accessibility Summary
+
+**Total Issues Found:** ${totalA11yIssues}
+
+`;
+  }
+
   md += `---
 
 ## Device Evaluations
 
 `;
 
-  // Add each device evaluation with screenshot
+  // Comparison mode
+  if (compareDir) {
+    md += `> 📊 **Comparison Mode:** Showing before (left) and after (right) screenshots\n\n`;
+  }
+
   for (const result of results) {
     const evaluation = evaluations.find((e) => e.device === result.device);
     const statusIcon =
@@ -312,9 +520,27 @@ function generateMarkdownReport(
 
     md += `### ${statusIcon} ${result.device} (${result.viewport.width}x${result.viewport.height})
 
-![${result.device} Screenshot](./images/${result.filename})
+`;
+
+    // Comparison view
+    if (compareDir) {
+      const beforeImage = join(compareDir, "images", result.filename);
+      if (existsSync(beforeImage)) {
+        md += `| Before | After |
+|--------|-------|
+| ![Before](${beforeImage}) | ![After](./images/${result.filename}) |
 
 `;
+      } else {
+        md += `![${result.device} Screenshot](./images/${result.filename})
+
+`;
+      }
+    } else {
+      md += `![${result.device} Screenshot](./images/${result.filename})
+
+`;
+    }
 
     if (evaluation) {
       md += `**Status:** ${evaluation.status.replace("_", " ").toUpperCase()}
@@ -338,12 +564,20 @@ ${evaluation.suggestions.map((s) => `- ${s}`).join("\n")}
       }
     }
 
+    // Accessibility issues for this device
+    if (includeAccessibility && result.accessibilityIssues?.length) {
+      md += `**Accessibility Issues:**
+${result.accessibilityIssues.map((i) => `- **${i.type}**: ${i.description}${i.suggestion ? ` (Fix: ${i.suggestion})` : ""}`).join("\n")}
+
+`;
+    }
+
     md += `---
 
 `;
   }
 
-  // Add suggested modifications section for Cursor SDK
+  // Suggested modifications section
   md += `## Suggested Modifications
 
 This section contains actionable fixes that can be fed to the Cursor SDK coding agent.
@@ -384,6 +618,23 @@ ${evaluation.issues.map((i) => `- [ ] ${i}`).join("\n")}
     }
   }
 
+  // Accessibility fixes
+  if (includeAccessibility) {
+    md += `
+## Accessibility Fixes
+
+`;
+    const allA11yIssues = results.flatMap((r) => r.accessibilityIssues || []);
+    const uniqueTypes = [...new Set(allA11yIssues.map((i) => i.type))];
+
+    for (const type of uniqueTypes) {
+      const issue = allA11yIssues.find((i) => i.type === type);
+      if (issue) {
+        md += `- [ ] **${type}**: ${issue.suggestion || issue.description}\n`;
+      }
+    }
+  }
+
   md += `\`\`\`
 
 ---
@@ -407,7 +658,10 @@ ${rawResponse}
   return md;
 }
 
-async function generatePdf(markdownPath: string, pdfPath: string): Promise<void> {
+async function generatePdf(
+  markdownPath: string,
+  pdfPath: string
+): Promise<void> {
   console.log(`📄 Generating PDF...`);
 
   const stylesheetPath = join(__dirname, "..", "report-style.css");
@@ -422,7 +676,7 @@ async function generatePdf(markdownPath: string, pdfPath: string): Promise<void>
           margin: { top: "20mm", right: "20mm", bottom: "20mm", left: "20mm" },
           printBackground: true,
         },
-        stylesheet: stylesheetPath,
+        stylesheet: [stylesheetPath],
       }
     );
     console.log(`   ✅ PDF saved: ${pdfPath}`);
@@ -435,19 +689,37 @@ async function generatePdf(markdownPath: string, pdfPath: string): Promise<void>
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
-  if (args.length < 1) {
+  // Parse arguments
+  let url = "";
+  let customTask = "";
+  let includeAccessibility = false;
+  let compareDir = "";
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--accessibility") {
+      includeAccessibility = true;
+    } else if (args[i] === "--compare" && args[i + 1]) {
+      compareDir = args[i + 1];
+      i++;
+    } else if (!url) {
+      url = args[i];
+    } else if (!customTask) {
+      customTask = args[i];
+    }
+  }
+
+  if (!url) {
     console.log(`
 📱 Multi-Viewport Screenshot Test with Report Generation
 
 Tests a page across multiple device viewports and generates a report.
 
 Usage:
-  npx tsx src/examples/viewport-test.ts <url> ["<task>"]
+  npx tsx src/examples/viewport-test.ts <url> [options] ["<task>"]
 
-Output:
-  • Markdown report (for feeding to Cursor SDK)
-  • PDF report (for sharing/review)
-  • Screenshots for each viewport
+Options:
+  --accessibility     Include accessibility audit (uses Puppeteer Accessibility.snapshot)
+  --compare <dir>     Compare with previous report (generates before/after view)
 
 Viewports tested:
   • iPhone 15 Pro (393x852) - Mobile iOS
@@ -457,12 +729,15 @@ Viewports tested:
 
 Examples:
   npx tsx src/examples/viewport-test.ts http://localhost:5173
-  npx tsx src/examples/viewport-test.ts https://example.com "Check navigation"
+  npx tsx src/examples/viewport-test.ts http://localhost:5173 --accessibility
+  npx tsx src/examples/viewport-test.ts http://localhost:5173 --compare output/report-2026-01-14T18-49-04
+
+Environment:
+  WAIT_TIME=3000  - Wait time in ms after page load (default: 2000)
 `);
     process.exit(1);
   }
 
-  const [url, customTask] = args;
   const waitTime = parseInt(process.env.WAIT_TIME || "2000", 10);
 
   console.log("🚀 Multi-Viewport Screenshot Test\n");
@@ -473,15 +748,28 @@ Examples:
   mkdirSync(reportDir, { recursive: true });
 
   // Take screenshots
-  const results = await takeMultiViewportScreenshots(url, reportDir, waitTime);
+  const results = await takeMultiViewportScreenshots(url, reportDir, {
+    waitTime,
+    includeAccessibility,
+  });
   console.log(`\n📸 ${results.length} screenshots captured.`);
 
   // Evaluate with AI
-  const { evaluations, rawResponse } = await evaluateScreenshots(results, url, customTask);
+  const { evaluations, rawResponse } = await evaluateScreenshots(results, url, {
+    customTask,
+    includeAccessibility,
+  });
 
   // Generate markdown report
   console.log(`\n📝 Generating report...`);
-  const markdown = generateMarkdownReport(url, results, evaluations, rawResponse, timestamp);
+  const markdown = generateMarkdownReport(
+    url,
+    results,
+    evaluations,
+    rawResponse,
+    timestamp,
+    { includeAccessibility, compareDir }
+  );
 
   const markdownPath = join(reportDir, "report.md");
   writeFileSync(markdownPath, markdown);
@@ -501,8 +789,9 @@ Files:
   • report.pdf   - PDF (for review/sharing)
   • images/      - Screenshots
 
+${compareDir ? `📊 Compared with: ${compareDir}\n` : ""}${includeAccessibility ? "♿ Accessibility audit included\n" : ""}
 To fix issues with Cursor SDK:
-  cat ${markdownPath} | grep -A 100 "Suggested Modifications"
+  npx tsx src/examples/fix-responsive.ts ${reportDir} <target-repo>
 ─────────────────────────────────────────────────────────────
 `);
 }
