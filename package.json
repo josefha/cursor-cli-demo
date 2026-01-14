@@ -1,0 +1,31 @@
+{
+  "name": "cursor-cli-demo",
+  "version": "1.0.0",
+  "description": "Demo project for Cursor SDK (Alpha)",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "example:stream": "tsx src/examples/stream.ts",
+    "example:callbacks": "tsx src/examples/callbacks.ts",
+    "screenshot": "tsx src/examples/screenshot-test.ts",
+    "screenshot:login": "tsx src/examples/screenshot-test.ts --login"
+  },
+  "keywords": [
+    "cursor",
+    "ai",
+    "agent"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@cursor-ai/january": "latest",
+    "dotenv": "^16.4.0",
+    "puppeteer": "^24.35.0"
+  }
+}
