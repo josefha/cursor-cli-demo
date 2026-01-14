@@ -10,7 +10,8 @@
     "example:stream": "tsx src/examples/stream.ts",
     "example:callbacks": "tsx src/examples/callbacks.ts",
     "screenshot": "tsx src/examples/screenshot-test.ts",
-    "screenshot:login": "tsx src/examples/screenshot-test.ts --login"
+    "screenshot:login": "tsx src/examples/screenshot-test.ts --login",
+    "viewport-test": "tsx src/examples/viewport-test.ts"
   },
   "keywords": [
     "cursor",
@@ -26,6 +27,7 @@
   "dependencies": {
     "@cursor-ai/january": "latest",
     "dotenv": "^16.4.0",
+    "md-to-pdf": "^5.2.5",
     "puppeteer": "^24.35.0"
   }
 }

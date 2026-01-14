@@ -26,3 +26,6 @@ screenshots/
 
 # Browser profile (contains session data)
 .browser-profile/
+
+# Output reports
+output/
